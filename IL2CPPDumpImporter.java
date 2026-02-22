@@ -15,6 +15,7 @@ import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolTable;
 import ghidra.util.exception.CancelledException;
+import ghidra.util.exception.UsrException;
 
 import org.json.*;
 
@@ -23,6 +24,7 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -41,12 +43,13 @@ public class IL2CPPDumpImporter extends GhidraScript {
 	private int classesToAdd;
 	private String classFilter;
 	private BufferedWriter logWriter;
+	private boolean exitOnError;
 
 	private JSONObject il2cppDump;
 	private HashMap<String, RETypeDefinition> typeMap;
 
 	@Override
-	protected void run() throws Exception {
+	protected void run() throws ExitException, Exception {
 		initialize();
 		importIL2CPPDump();
 	}
@@ -67,6 +70,9 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		if (typeManager == null) {
 			throw new Exception("failed to find typemanager");
 		}
+
+		// exitOnError = askYesNo("Exit on Error", "Should the script cancel when it
+		// encounters an error?");
 
 		try {
 			var logFile = askFile("Select Log File", "Open");
@@ -112,9 +118,12 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				DataTypeConflictHandler.DEFAULT_HANDLER);
 
 		// Terminology:
-		// - ValueType: A type that inherits (directly or indirectly) from System.ValueType or System.Enum
-		// - Primitive Type: A ValueType with size <= sizeof(void*). Hardcoded here for simplicity.
-		// - Reference Type: A type that is not a ValueType. All Reference Types are stored on the heap and are only accessed via pointers.
+		// - ValueType: A type that inherits (directly or indirectly) from
+		// System.ValueType or System.Enum
+		// - Primitive Type: A ValueType with size <= sizeof(void*). Hardcoded here for
+		// simplicity.
+		// - Reference Type: A type that is not a ValueType. All Reference Types are
+		// stored on the heap and are only accessed via pointers.
 		primitiveTypes = new HashMap<>();
 		primitiveTypes.put("System.Single", builtinTypeManager.getDataType("/float"));
 		primitiveTypes.put("System.Double", builtinTypeManager.getDataType("/double"));
@@ -221,7 +230,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		return primitiveTypes.get(objectName);
 	}
 
-	private DataType getValueTypeOrType(String name) {
+	private DataType getValueTypeOrType(String name) throws ExitException {
 		// Top-level types start with a '/', should only occur for built-in types.
 		if (name.charAt(0) == '/') {
 			var dt = typeManager.getDataType(name);
@@ -251,7 +260,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		return null;
 	}
 
-	private DataType getPassingType(String name, boolean forField) {
+	private DataType getPassingType(String name, boolean forField) throws ExitException {
 		// Primitive types are always used in their value form and are never passed by
 		// reference, unless a parameters explicitly has a ByRef/In/Out flag,
 		// in which case the caller is responsible for handling that.
@@ -263,12 +272,14 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		var typedef = typeMap.get(name);
 
 		if (forField) {
-			// ValueType and Enum fields are always stored in their value form, even if they are larger than 8 bytes.
+			// ValueType and Enum fields are always stored in their value form, even if they
+			// are larger than 8 bytes.
 			if (typedef != null && (typedef.isEnum || typedef.isValueType)) {
 				return type;
 			}
 		} else {
-			// If the type is a ValueType and its size is greater than 8 bytes, it is passed as a pointer.
+			// If the type is a ValueType and its size is greater than 8 bytes, it is passed
+			// as a pointer.
 			if (typedef != null && (typedef.isValueType || typedef.isEnum) && type.getLength() <= 8) {
 				return type;
 			}
@@ -286,22 +297,29 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		return typedef != null && typedef.isValueType && type.getLength() > 8;
 	}
 
-	private DataType getPassingType(String name) {
+	private DataType getPassingType(String name) throws ExitException {
 		return getPassingType(name, false);
 	}
 
-	private Namespace getOrCreateNamespace(String name) {
+	private Namespace getOrCreateNamespace(String name) throws ExitException {
+		// Edge case that I honestly cba to handle because it's pretty rare. So just log
+		// and move on.
+		if (name.contains("[[")) {
+			logError("Could not create namespace for: " + name);
+			return null;
+		}
+
 		// Packed into a function because I hate java's enforced exception handling or
 		// continued propagating.
 		try {
 			return symbolTable.getOrCreateNameSpace(currentProgram.getGlobalNamespace(), name, SourceType.IMPORTED);
 		} catch (Exception e) {
-			println("error getOrCreateNamespace:" + e.getMessage());
+			logException("Failed to get/create namespace", e);
 			return null;
 		}
 	}
 
-	private void parseClass(String name) {
+	private void parseClass(String name) throws ExitException {
 		if (!typeMap.containsKey(name)) {
 			return;
 		}
@@ -310,6 +328,11 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		if (definition.dataType != null) {
 			return;
 		}
+
+		// `name` here is still in its raw form. Some types are assembly-qualified, and
+		// we don't want that as part of our type- or namespace names.
+		// Importantly tho, the typeMap still refers to this type by its raw name.
+		var realName = definition.name;
 
 		// Not actually an accurate display of progress if a filter is used but at least
 		// gives me an idea of how much was already completed lol.
@@ -331,15 +354,13 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		}
 
 		if (definition.isValueType && !definition.isEnum) {
-			parseValueType(name, definition);
+			parseValueType(realName, definition);
 		} else {
-			parseReferenceType(name, definition);
+			parseReferenceType(realName, definition);
 		}
-
-		println(String.format("parsing %s done", name));
 	}
 
-	private void parseReferenceType(String name, RETypeDefinition definition) {
+	private void parseReferenceType(String name, RETypeDefinition definition) throws ExitException {
 		// Create ghidra type from type definition
 		DataType type = new StructureDataType(name, definition.size);
 
@@ -355,7 +376,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				if (!field.isStatic()) {
 					continue;
 				}
-				
+
 				try {
 					enumType.add(field.name, field.defaultValue);
 				} catch (IllegalArgumentException e) {
@@ -383,7 +404,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 
 		// Add all fields to the class
 		if (definition.dataType instanceof Structure) {
-			if (definition.name.endsWith("[]")) {
+			if (definition.isArray) {
 				addFieldsToArrayType(definition, (Structure) definition.dataType);
 			} else {
 				addFieldsOfClassToType(definition, (Structure) definition.dataType, false);
@@ -398,11 +419,11 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		}
 	}
 
-	private void parseValueType(String name, RETypeDefinition definition) {
+	private void parseValueType(String name, RETypeDefinition definition) throws ExitException {
 		var valueTypeSize = definition.size - typeMap.get("System.Object").size;
 		if (valueTypeSize <= 0) {
 			logError("Value type size is less than or equal to 0: " + name);
-			
+
 			// We still need to register the type so just parse it as a reference type
 			parseReferenceType(name, definition);
 			return;
@@ -417,7 +438,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		definition.dataType = typeManager.addDataType(valueType, DataTypeConflictHandler.REPLACE_HANDLER);
 		definition.pointerTo = typeManager.addDataType(new PointerDataType(definition.dataType),
 				DataTypeConflictHandler.REPLACE_HANDLER);
-			
+
 		var boxedGhidraType = typeManager.addDataType(boxedType, DataTypeConflictHandler.REPLACE_HANDLER);
 		typeManager.addDataType(new PointerDataType(boxedGhidraType), DataTypeConflictHandler.REPLACE_HANDLER);
 
@@ -438,7 +459,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		}
 	}
 
-	private void handleStaticGetter(RETypeDefinition parent, REMethod method) {
+	private void handleStaticGetter(RETypeDefinition parent, REMethod method) throws ExitException {
 		try {
 			var fieldName = method.name.substring(4);
 			var fieldType = getPassingType(method.returnType);
@@ -464,14 +485,16 @@ public class IL2CPPDumpImporter extends GhidraScript {
 
 			createLabel(addr, fieldName, getOrCreateNamespace(parent.name), false, SourceType.IMPORTED);
 			createData(addr, fieldType);
+		} catch (ClassCastException e) {
+			// Not a real problem so just log and continue
+			logError(String.format("Could not create data for static getter: %s", e.getMessage()));
+			return;
 		} catch (Exception e) {
-			// printf("Failed to parse static getter:  %s", e.getMessage());
-			// println();
 			logException("Failed to parse static getter: " + method.name, e);
 		}
 	}
 
-	private void parseMethod(REMethod method, RETypeDefinition parent) {
+	private void parseMethod(REMethod method, RETypeDefinition parent) throws ExitException {
 		if (method.address == 0) {
 			return;
 		}
@@ -481,13 +504,17 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		}
 
 		// If there are already symbols here, there are 2 possibilities:
-		// 1. This is a generic function and we don't actually want to have a typed function, 
-		// remove the function if it's there and add labels and a generic function to mark it's been acknowledged
-		// 2. There is a symbol that was placed there automatically by ghidra (SourceType.DEFAULT),
+		// 1. This is a generic function and we don't actually want to have a typed
+		// function,
+		// remove the function if it's there and add labels and a generic function to
+		// mark it's been acknowledged
+		// 2. There is a symbol that was placed there automatically by ghidra
+		// (SourceType.DEFAULT),
 		// in this case we can just overwrite it with our function.
 		var address = addressFactory.getAddress(method.addressString);
 		var symbol = getSymbolAt(address);
-		if (symbol != null && symbol.getSource() != SourceType.DEFAULT) {
+		var symbolSource = symbol != null ? symbol.getSource() : SourceType.DEFAULT;
+		if (symbol != null && symbolSource != SourceType.DEFAULT) {
 			try {
 				Function existing = functionManager.getFunctionAt(address);
 				if (existing != null && existing.getParentNamespace() != currentProgram.getGlobalNamespace()) {
@@ -504,7 +531,6 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				createLabel(address, method.name, getOrCreateNamespace(parent.name), false,
 						SourceType.USER_DEFINED);
 			} catch (Exception e) {
-				// println("error creating label for generic function: " + e.getMessage());
 				logException("error creating label for generic function: " + method.name, e);
 			}
 			return;
@@ -512,15 +538,29 @@ public class IL2CPPDumpImporter extends GhidraScript {
 
 		Function function;
 
-		// If the function does not yet exist then we try to create it and then rename it.
+		// If the function does not yet exist then we try to create it and then rename
+		// it.
 		try {
+			if (symbol != null && symbolSource != SourceType.USER_DEFINED && symbolSource != SourceType.IMPORTED) {
+				symbol.delete();
+			}
+
 			function = createFunction(address, method.name);
-			function.setParentNamespace(getOrCreateNamespace(parent.name));
+			if (function != null) {
+				function.setParentNamespace(getOrCreateNamespace(parent.name));
+
+				// Set the source type to IMPORTED so if, in recursive calls, this function is
+				// encountered again, it knows not to delete it and to add a label instead.
+				function.getSymbol().setSource(SourceType.IMPORTED);
+			} else {
+				logError("Failed to create function: " + parent.name + "." + method.name);
+				return;
+			}
+
 			// That could be useful, but it's not worth the huge slowdown it causes
 			// function.setComment(String.format("flags: %s\nimpl flags: %s", method.flags,
 			// method.implFlags));
 		} catch (Exception e) {
-			// println("error creating function: " + e.getMessage());
 			logException("error creating function: " + method.name, e);
 			return;
 		}
@@ -573,17 +613,22 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				funcParams.add(new ParameterImpl(param.name, getValueTypeOrType(param.type), currentProgram));
 			}
 
-			// Using this function because Function.addParameter is deprecated. This also makes
-			// things easier as ghidra tries to determine Register and stack offset by itself.
+			// Using this function because Function.addParameter is deprecated. This also
+			// makes things easier as ghidra tries to determine Register and stack offset by
+			// itself.
 			function.updateFunction("__fastcall", ret, funcParams,
 					Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.IMPORTED);
+		} catch (ConcurrentModificationException e) {
+			// This happens if a recursive call deleted the current function because they're
+			// at the same address. This is safe to ignore because these edge cases are
+			// already handled above.
+			return;
 		} catch (Exception e) {
-			// println("error parsing function signature:" + e.getMessage());
 			logException("error parsing function signature for " + parent.name + "." + method.name, e);
 		}
 	}
 
-	private void addFieldsToArrayType(RETypeDefinition definition, Structure type) {
+	private void addFieldsToArrayType(RETypeDefinition definition, Structure type) throws ExitException {
 		type.deleteAll();
 		type.growStructure(0x20);
 
@@ -604,7 +649,8 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				containedDataType.getLength(), "Elements", "");
 	}
 
-	private void addFieldsOfClassToType(RETypeDefinition definition, Structure type, boolean isValueType) {
+	private void addFieldsOfClassToType(RETypeDefinition definition, Structure type, boolean isValueType)
+			throws ExitException {
 		if (definition == null) {
 			return;
 		}
@@ -636,14 +682,24 @@ public class IL2CPPDumpImporter extends GhidraScript {
 					continue;
 				}
 
+				var offset = isValueType ? field.offsetFromFieldPtr : field.offsetFromBase;
+				var existingField = type.getDataTypeAt(offset);
+				if (existingField != null && existingField.getFieldName() != null
+						&& existingField.getDataType() != null) {
+					// If a field already exists at this offset we skip it. This can happen for
+					// union types.
+					logError(String.format("Field %s cannot be added to %s because there is already a field at 0x%X",
+							field.name, type.getName(), offset));
+					continue;
+				}
+
 				var fieldDataType = getPassingType(typeName, true);
 				type.replaceAtOffset(
-					isValueType ? field.offsetFromFieldPtr : field.offsetFromBase,
-					fieldDataType, 
-					fieldDataType.getLength(), 
-					field.name,
-					field.flags
-				);
+						offset,
+						fieldDataType,
+						fieldDataType.getLength(),
+						field.name,
+						field.flags);
 			}
 		}
 	}
@@ -652,39 +708,46 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		if (logWriter == null) {
 			println("Encountered Error: ");
 			println(message);
-			return;
-		}
-
-		try {
-			logWriter.write("Encountered Error: ");
-			logWriter.newLine();
-			logWriter.write(message);
-			logWriter.newLine();
-		} catch (Exception e) {
-			println("error writing to log file: " + e.getMessage());
+		} else {
+			try {
+				logWriter.write("Encountered Error: ");
+				logWriter.newLine();
+				logWriter.write(message);
+				logWriter.newLine();
+			} catch (Exception e) {
+				println("error writing to log file: " + e.getMessage());
+			}
 		}
 	}
 
-	private void logException(String message, Exception e) {
+	private void logException(String message, Exception e) throws ExitException {
+		// Propagate ExitException without logging
+		if (e instanceof ExitException) {
+			throw (ExitException) e;
+		}
+
 		if (logWriter == null) {
 			println("Encountered Exception: ");
 			println(message);
 			println(e.getMessage());
 			println(e.getStackTrace()[0].toString());
-			return;
+		} else {
+			try {
+				logWriter.write("Encountered Exception: ");
+				logWriter.newLine();
+				logWriter.write(message);
+				logWriter.newLine();
+				logWriter.write(e.getMessage());
+				logWriter.newLine();
+				logWriter.write(e.getStackTrace()[0].toString());
+				logWriter.newLine();
+			} catch (Exception ex) {
+				println("error writing to log file: " + ex.getMessage());
+			}
 		}
 
-		try {
-			logWriter.write("Encountered Exception: ");
-			logWriter.newLine();
-			logWriter.write(message);
-			logWriter.newLine();
-			logWriter.write(e.getMessage());
-			logWriter.newLine();
-			logWriter.write(e.getStackTrace()[0].toString());
-			logWriter.newLine();
-		} catch (Exception ex) {
-			println("error writing to log file: " + ex.getMessage());
+		if (exitOnError) {
+			throw new ExitException(message, e);
 		}
 	}
 
@@ -741,6 +804,10 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		}
 	}
 
+	private static Address toAddress(String address) {
+		return addressFactory.getAddress(address);
+	}
+
 	private static class REField {
 		public String flags;
 		public int id;
@@ -779,10 +846,12 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		public String name;
 		public int size;
 		public String parent;
+		public Address address;
 		public ArrayList<REField> fields;
 		public ArrayList<REMethod> methods;
 		public boolean isValueType;
 		public boolean isEnum;
+		public boolean isArray;
 		public String underlyingType;
 
 		public DataType dataType;
@@ -793,6 +862,7 @@ public class IL2CPPDumpImporter extends GhidraScript {
 			if (object.has("size"))
 				size = Integer.parseInt(object.getString("size"), 16);
 			parent = object.has("parent") ? object.getString("parent") : "";
+			address = object.has("address") ? toAddress(object.getString("address")) : null;
 			fields = new ArrayList<>();
 			methods = new ArrayList<>();
 
@@ -806,6 +876,8 @@ public class IL2CPPDumpImporter extends GhidraScript {
 				isValueType = false;
 				isEnum = false;
 			}
+
+			isArray = parent.equals("System.Array");
 
 			if (isEnum) {
 				// Get the enums underlying type
@@ -833,6 +905,21 @@ public class IL2CPPDumpImporter extends GhidraScript {
 					methods.add(method);
 				}
 			}
+
+			// This is for types that are assembly-qualified, which will not produce a valid
+			// namespace name.
+			// If the passed dump doesn't yet have the "element_type_name" attributes we
+			// could try to parse it ourselves but like... That's a pain so I'll just ignore
+			// that for now.
+			if (object.has("element_type_name")) {
+				name = object.getString("element_type_name");
+
+				// The element_type_name doesn't contain the '[]' for arrays so we add it
+				// manually
+				if (isArray) {
+					name += "[]";
+				}
+			}
 		}
 
 		public boolean hasFields() {
@@ -841,6 +928,12 @@ public class IL2CPPDumpImporter extends GhidraScript {
 
 		public boolean hasParent() {
 			return !parent.isEmpty();
+		}
+	}
+
+	private class ExitException extends UsrException {
+		public ExitException(String msg, Throwable cause) {
+			super("Script was cancelled because of an error: " + msg, cause);
 		}
 	}
 }
