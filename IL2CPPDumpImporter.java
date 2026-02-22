@@ -321,6 +321,15 @@ public class IL2CPPDumpImporter extends GhidraScript {
 			monitor.setMaximum(classesToAdd);
 		}
 
+		// Create TypeInfo label
+		try {
+			if (definition.address != null) {
+				createLabel(definition.address, "TypeInfo", getOrCreateNamespace(realName), false, SourceType.IMPORTED);
+			}
+		} catch (Exception e) {
+			logException("error creating TypeInfo label for " + name, e);
+		}
+
 		if (definition.isValueType && !definition.isEnum) {
 			parseValueType(name, definition);
 		} else {
