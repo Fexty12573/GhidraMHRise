@@ -661,10 +661,12 @@ public class IL2CPPDumpImporter extends GhidraScript {
 		type.setDescription(String.format("%s:0x%x -> ", definition.name, definition.size) + type.getDescription());
 		if (definition.hasFields()) {
 			try {
-				addFieldsToType(definition.fields, type, isValueType);
+				// Add parent fields before child fields
 				if (definition.hasParent()) {
 					addFieldsOfClassToType(typeMap.get(definition.parent), type, isValueType);
 				}
+
+				addFieldsToType(definition.fields, type, isValueType);
 			} catch (Exception e) {
 				logException("error adding fields to type: " + definition.name, e);
 			}
@@ -897,6 +899,10 @@ public class IL2CPPDumpImporter extends GhidraScript {
 					fields.add(new REField(fieldName, classFields.getJSONObject(fieldName)));
 				}
 			}
+
+			// Ensure fields are added in order of id, in case there are multiple fields
+			// with the same offset (i.e. union types)
+			fields.sort((a, b) -> Integer.compare(a.id, b.id));
 
 			if (object.has("methods")) {
 				var classMethods = object.getJSONObject("methods");
