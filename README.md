@@ -30,7 +30,7 @@ This repository contains a script to import TDB Data from RE Engine games into G
 10. Click on the 3 horizontal lines icon in the top right of the window.
 11. Click on the Green **+** icon and select the `GhidraREFramework` directory.
 12. Find the IL2CPPDumpImporter script in the script manager and run it.
-    * I recommend leaving the import filter set to `snow`/`app`/`via`/`System`. *If* you gave ghidra enough RAM (8GB+), the script should finish in approximately 10-20 minutes.
+    * I recommend leaving the import filter set to `snow`/`app`/`via`/`System`. *If* you gave ghidra enough RAM (8GB+), the script should finish in anywhere between 3-10 minutes.
     * Also note that, the way the filter works, is that it will import every class that starts with the filter, *and* it will import as many classes as needed to fully construct those types, recursively.
     * The script will ask for an image base, usually `0x140000000` is fine for most games. Make sure it is correct however because if it is not, the script will not work.
 
